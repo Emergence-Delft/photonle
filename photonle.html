@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>photonle</title>
+<style>
+  /* palette — swap these to change the whole look */
+  :root{
+    --bg:#040404; --ink:#3a3a3a; --faint:#1e1e1e; --dim:#7a7a7a; --text:#f2f2f2; --light:#ffffff;
+    /* Emergence Delft colours: blue, yellow, pink */
+    --c0:#009DF4; --c1:#FFED00; --c2:#E5007D;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--bg);color:var(--text);
+    font:14px/1.4 "Helvetica Neue",Helvetica,Arial,sans-serif}
+  main{max-width:620px;margin:0 auto;padding:28px 18px;display:flex;flex-direction:column;align-items:center;gap:18px}
+  canvas{width:100%;display:block;touch-action:none;user-select:none}
+  .part{width:44px;height:44px;cursor:grab;touch-action:none;border-radius:0}
+  .part:hover{background:#111}
+  #tools{display:flex;align-items:center;gap:10px;flex-wrap:wrap;justify-content:center}
+  .tool{background:none;border:1px solid transparent;border-radius:0;padding:6px 10px;color:var(--text);
+    font:inherit;cursor:pointer;display:flex;align-items:center;gap:6px}
+  .tool:hover{border-color:var(--faint)}
+</style>
+</head>
+<body>
+<main>
+  <canvas id="c"></canvas>
+  <div id="tools"></div>
+</main>
+
+<script>
+"use strict";
+// ---------------------------------------------------------------------------
+// config
+// ---------------------------------------------------------------------------
+const css = getComputedStyle(document.documentElement);
+const V = n => css.getPropertyValue(n).trim();
+const PAL = { bg: V('--bg'), ink: V('--ink'), faint: V('--faint'), dim: V('--dim'), light: V('--light'),
+              col: [V('--c0'), V('--c1'), V('--c2')] };
+const COLS = 5, ROWS = 5, LASER_ROW = 2;
+
+// sides / directions: 0=E 1=S 2=W 3=N   (screen y points down)
+const DX = [1, 0, -1, 0], DY = [0, 1, 0, -1];
+const MID = [[1, .5], [.5, 1], [0, .5], [.5, 0]];
+const opp = s => (s + 2) % 4;
+
+// component variants (cycled by clicking)
+const WG = [[2, 0], [3, 1], [2, 3], [3, 0], [0, 1], [1, 2]];          // ─ │ ┘ └ ┌ ┐
+const CP = [[[2, 3], [1, 0]], [[2, 1], [3, 0]]];                      // two kissing bends
+// ring: a plain circle. off-resonance light goes straight through,
+// the resonant colour turns 90° (variant 0 = right turn, 1 = left turn)
+const RING_TURNS = 2;
+
+// ---------------------------------------------------------------------------
+// geometry (unit cell coords)
+// ---------------------------------------------------------------------------
+// boxy geometry: straight, or one sharp 90° corner at the cell centre
+function guidePts(a, b) {
+  return opp(a) === b ? [MID[a], MID[b]] : [MID[a], [.5, .5], MID[b]];
+}
+// coupler bend: corner cut at 45°, so the two guides run side by side
+// along parallel diagonals (the coupling region)
+const CUT = .2;
+function cpPts(a, b) {
+  const near = s => [.5 + DX[s] * CUT, .5 + DY[s] * CUT];
+  return [MID[a], near(a), near(b), MID[b]];
+}
+const half = (p, q) => [(p[0] + q[0]) / 2, (p[1] + q[1]) / 2];
+const RING_R = .26;
+const rim = s => [.5 + DX[s] * RING_R, .5 + DY[s] * RING_R];
+
+// ---------------------------------------------------------------------------
+// light: incoherent power tracing, per wavelength
+// ---------------------------------------------------------------------------
+function behave(c, e, p) {
+  if (c.t === 'w') {
+    const g = WG[c.v]; if (!g.includes(e)) return [];
+    const o = g[0] === e ? g[1] : g[0];
+    return [{ s: o, p, pts: guidePts(e, o) }];
+  }
+  if (c.t === 'c') {
+    const gs = CP[c.v], g = gs.find(g => g.includes(e)); if (!g) return [];
+    const own = g[0] === e ? g[1] : g[0];
+    const other = gs.find(x => x !== g), cs = opp(e);
+    const hp = p.map(x => x / 2);
+    const ownPts = cpPts(e, own);
+    const o = cpPts(other[0] === cs ? other[1] : other[0], cs);
+    return [{ s: own, p: hp, pts: ownPts },
+            { s: cs, p: hp, pts: [ownPts[0], ownPts[1], half(ownPts[1], ownPts[2]), half(o[1], o[2]), o[2], o[3]] }];
+  }
+  if (c.t === 'r') {
+    const k = c.k, d = opp(e);
+    const out = [{ s: -1, p, pts: [MID[e], rim(e)] }];          // incoming light, drawn only
+    const pass = p.map((x, i) => i === k ? 0 : x);
+    if (pass.some(x => x > 0)) out.push({ s: d, p: pass, pts: [rim(d), MID[d]] });
+    if (p[k] > 0) {
+      const t = c.v === 0 ? (d + 1) % 4 : (d + 3) % 4;
+      out.push({ s: t, p: p.map((x, i) => i === k ? x : 0), pts: [rim(t), MID[t]], ring: true });
+    }
+    return out;
+  }
+  return [];
+}
+
+function trace(G) {
+  const lit = [], det = DETS.map(() => [0, 0, 0]);
+  const q = [{ x: 0, y: LASER_ROW, d: 0, p: [1, 1, 1] }];
+  let steps = 0;
+  while (q.length && steps++ < 5000) {
+    const b = q.shift();
+    if (Math.max(...b.p) < 0.004) continue;
+    if (b.x < 0 || b.y < 0 || b.x >= COLS || b.y >= ROWS) {
+      if (b.x === COLS && b.d === 0) {
+        const i = DETS.findIndex(D => D.row === b.y);
+        if (i >= 0) b.p.forEach((v, k) => det[i][k] += v);
+      }
+      continue;
+    }
+    const c = G[b.y][b.x]; if (!c) continue;
+    for (const o of behave(c, opp(b.d), b.p)) {
+      lit.push({ x: b.x, y: b.y, pts: o.pts, p: o.p, ring: o.ring ? c : null });
+      if (o.s >= 0) q.push({ x: b.x + DX[o.s], y: b.y + DY[o.s], d: o.s, p: o.p });
+    }
+  }
+  return { lit, det };
+}
+
+// ---------------------------------------------------------------------------
+// daily puzzle: which rows the three circles sit on, and their colour order
+// ---------------------------------------------------------------------------
+function mulberry32(a) {
+  return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+}
+const now = new Date();
+const DAY = Math.floor((Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()) - Date.UTC(2026, 10, 1)) / 864e5) + 1;
+const rng = mulberry32((Math.imul(DAY, 0x9E3779B1) ^ 0x5bd1e995) >>> 0);
+const rows = [...Array(ROWS).keys()];
+for (let i = rows.length - 1; i > 0; i--) { const j = Math.floor(rng() * (i + 1)); [rows[i], rows[j]] = [rows[j], rows[i]]; }
+const order = [0, 1, 2];
+for (let i = 2; i > 0; i--) { const j = Math.floor(rng() * (i + 1)); [order[i], order[j]] = [order[j], order[i]]; }
+const DETS = rows.slice(0, 3).sort((a, b) => a - b).map((row, i) => ({ row, k: order[i] }));
+
+// ---------------------------------------------------------------------------
+// state
+// ---------------------------------------------------------------------------
+let grid = Array.from({ length: ROWS }, () => Array(COLS).fill(null));
+const KEY = 'photonle3:' + DAY;
+try { const s = JSON.parse(localStorage.getItem(KEY)); if (s && s.length === ROWS) grid = s; } catch (e) {}
+const save = () => { try { localStorage.setItem(KEY, JSON.stringify(grid)); } catch (e) {} };
+
+// ---------------------------------------------------------------------------
+// drawing
+// ---------------------------------------------------------------------------
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+let S = 60, OX = 0, OY = 0;             // cell size and grid origin (css px)
+const MARGIN_L = 1.3, MARGIN_R = 1.5;
+
+function layout() {
+  const w = cv.clientWidth;
+  S = w / (COLS + MARGIN_L + MARGIN_R);
+  const h = S * (ROWS + .4);
+  cv.style.height = h + 'px';
+  const dpr = window.devicePixelRatio || 1;
+  cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  OX = S * MARGIN_L; OY = S * .2;
+}
+const P = (x, y, u) => [OX + (x + u[0]) * S, OY + (y + u[1]) * S];
+
+function poly(pts, color, w, g = ctx) {
+  const ctx = g;
+  ctx.strokeStyle = color; ctx.lineWidth = w; ctx.lineCap = 'butt'; ctx.lineJoin = 'miter';
+  ctx.beginPath(); let up = true;
+  for (const p of pts) { if (!p) { up = true; continue; } up ? ctx.moveTo(p[0], p[1]) : ctx.lineTo(p[0], p[1]); up = false; }
+  ctx.stroke();
+}
+// combine the wavelengths in a waveguide into one colour:
+// power-weighted additive mix, normalised so the brightest channel is full;
+// all three at equal power is pure white light
+const RGB = PAL.col.map(h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16)));
+function mix(p) {
+  const peak = Math.max(...p), dim = 0.4 + 0.6 * Math.min(1, peak);  // half power = dimmer
+  let c;
+  if (p.every(v => Math.abs(v - p[0]) < 1e-6)) c = [255, 255, 255];
+  else {
+    c = [0, 1, 2].map(ch => p.reduce((a, v, k) => a + v * RGB[k][ch], 0));
+    const m = Math.max(...c) || 1; c = c.map(v => v / m * 255);
+  }
+  return `rgb(${c.map(v => Math.round(v * dim)).join(',')})`;
+}
+const WG_W = () => Math.max(3, S * .075);     // waveguide width
+function strands(pts, p) {
+  const peak = Math.max(...p);
+  if (peak <= 0.004) return;
+  poly(pts, mix(p), WG_W());
+}
+
+// draw one component with its cell's top-left at (ox, oy), on any 2D context
+function drawPiece(g, ox, oy, size, c, color = PAL.ink) {
+  const lw = WG_W();
+  const at = u => [ox + u[0] * size, oy + u[1] * size];
+  const guide = (a, b) => poly(guidePts(a, b).map(at), color, lw, g);
+  if (c.t === 'w') guide(...WG[c.v]);
+  else if (c.t === 'c') CP[c.v].forEach(([a, b]) => poly(cpPts(a, b).map(at), color, lw, g));
+  else if (c.t === 'r') {
+    g.strokeStyle = PAL.col[c.k]; g.lineWidth = lw;
+    g.beginPath(); g.arc(ox + .5 * size, oy + .5 * size, RING_R * size, 0, Math.PI * 2); g.stroke();
+  }
+}
+const drawCell = (x, y, c) => { const [ox, oy] = P(x, y, [0, 0]); drawPiece(ctx, ox, oy, S, c); };
+
+function draw() {
+  layout();
+  const G = viewGrid();
+  const { lit, det } = trace(G);
+  ctx.clearRect(0, 0, cv.width, cv.height);
+
+  // grid dots
+  ctx.fillStyle = PAL.faint;
+  for (let y = 0; y < ROWS; y++) for (let x = 0; x < COLS; x++) {
+    if (G[y][x]) continue;
+    const [px, py] = P(x, y, [.5, .5]);
+    const d = Math.max(2, S * .05); ctx.fillRect(px - d / 2, py - d / 2, d, d);
+  }
+  // components
+  for (let y = 0; y < ROWS; y++) for (let x = 0; x < COLS; x++) if (G[y][x]) drawCell(x, y, G[y][x]);
+
+  // laser + its lead
+  const [lx, ly] = P(-1, LASER_ROW, [.5, .5]);
+  strands([[lx, ly], P(0, LASER_ROW, [0, .5])], [1, 1, 1]);
+  ctx.fillStyle = PAL.light;
+  const ls = S * .34; ctx.fillRect(lx - ls / 2 - S * .1, ly - ls / 2, ls, ls);
+
+  // light
+  for (const L of lit) {
+    strands(L.pts.map(u => u && P(L.x, L.y, u)), L.p);
+    if (L.ring) {
+      const [cx, cy] = P(L.x, L.y, [.5, .5]);
+      ctx.strokeStyle = PAL.col[L.ring.k]; ctx.lineWidth = WG_W();
+      ctx.beginPath(); ctx.arc(cx, cy, RING_R * S, 0, Math.PI * 2); ctx.stroke();
+    }
+  }
+
+  // detectors
+  DETS.forEach((D, i) => {
+    const p = det[i];
+    const [ex, ey] = P(COLS, D.row, [0, .5]);
+    const [dx, dy] = P(COLS, D.row, [.85, .5]);
+    const r = S * .27;
+    poly([[ex, ey], [dx - r, dy]], PAL.faint, WG_W());
+    if (p.some(v => v > 0.004)) strands([[ex, ey], [dx - r, dy]], p);
+    const ok = p[D.k] > 0.05 && p.every((v, k) => k === D.k || v < 0.004);
+    ctx.lineWidth = WG_W(); ctx.strokeStyle = PAL.col[D.k];
+    ctx.beginPath(); ctx.arc(dx, dy, r, 0, Math.PI * 2);
+    if (ok) { ctx.fillStyle = PAL.col[D.k]; ctx.fill(); }
+    ctx.stroke();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// ui
+// ---------------------------------------------------------------------------
+
+// ---- toolbox: drag a part out of it onto the board ----
+const TOOLS = [{ t: 'w', v: 0 }, { t: 'c', v: 0 }, { t: 'r', v: 0, k: 0 }, { t: 'r', v: 0, k: 1 }, { t: 'r', v: 0, k: 2 }];
+function renderTools() {
+  const el = document.getElementById('tools');
+  el.innerHTML = TOOLS.map((_, i) => `<canvas class="part" data-i="${i}"></canvas>`).join('') +
+    `<button class="tool" id="clear">clear</button>`;
+  el.querySelectorAll('.part').forEach(c => {
+    const T = TOOLS[+c.dataset.i], n = 44, dpr = window.devicePixelRatio || 1;
+    c.width = c.height = n * dpr; c.style.width = c.style.height = n + 'px';
+    const g = c.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    drawPiece(g, 0, 0, n, T, '#9a9a9a');
+    c.addEventListener('pointerdown', ev => startDrag(ev, { ...T }, null));
+  });
+  document.getElementById('clear').onclick = () => { grid = grid.map(r => r.map(() => null)); save(); draw(); };
+}
+
+// ---- drag & drop ----
+// drag a part from the toolbox onto a cell; drag a placed part to move it;
+// drop it off the board to remove it; tap a placed part to rotate it.
+let drag = null;  // { c, from:[x,y]|null, sx, sy, moved, over:[x,y]|null }
+const ghost = document.createElement('canvas');
+ghost.style.cssText = 'position:fixed;pointer-events:none;display:none;z-index:5';
+document.body.appendChild(ghost);
+
+function cellAt(ev) {
+  const r = cv.getBoundingClientRect();
+  const x = Math.floor((ev.clientX - r.left - OX) / S), y = Math.floor((ev.clientY - r.top - OY) / S);
+  return x >= 0 && y >= 0 && x < COLS && y < ROWS ? [x, y] : null;
+}
+// the board as it would look if the dragged part were dropped right now
+function viewGrid() {
+  if (!drag || !drag.moved || !drag.over) return grid;
+  const G = grid.map(r => r.slice());
+  G[drag.over[1]][drag.over[0]] = drag.c;
+  return G;
+}
+function startDrag(ev, c, from) {
+  ev.preventDefault();
+  drag = { c, from, sx: ev.clientX, sy: ev.clientY, moved: false, over: null };
+}
+function showGhost(ev) {
+  if (drag.over) { ghost.style.display = 'none'; return; }
+  const n = S, dpr = window.devicePixelRatio || 1;
+  if (ghost.width !== Math.round(n * dpr)) { ghost.width = ghost.height = Math.round(n * dpr); ghost.style.width = ghost.style.height = n + 'px'; }
+  const g = ghost.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, n, n);
+  drawPiece(g, 0, 0, n, drag.c, '#9a9a9a');
+  ghost.style.left = (ev.clientX - n / 2) + 'px'; ghost.style.top = (ev.clientY - n / 2) + 'px';
+  ghost.style.display = 'block';
+}
+const NVAR = { w: WG.length, c: CP.length, r: RING_TURNS };
+
+cv.addEventListener('pointerdown', ev => {
+  if (ev.button !== 0) return;
+  const at = cellAt(ev); if (!at || !grid[at[1]][at[0]]) return;
+  startDrag(ev, grid[at[1]][at[0]], at);
+});
+window.addEventListener('pointermove', ev => {
+  if (!drag) return;
+  if (!drag.moved) {
+    if (Math.hypot(ev.clientX - drag.sx, ev.clientY - drag.sy) < 6) return;
+    drag.moved = true;
+    if (drag.from) grid[drag.from[1]][drag.from[0]] = null;   // lift it off the board
+  }
+  drag.over = cellAt(ev);
+  showGhost(ev);
+  draw();
+});
+window.addEventListener('pointerup', () => {
+  if (!drag) return;
+  if (!drag.moved) {
+    if (drag.from) drag.c.v = (drag.c.v + 1) % NVAR[drag.c.t];   // tap = rotate
+  } else if (drag.over) {
+    grid[drag.over[1]][drag.over[0]] = drag.c;                   // drop (replaces what's there)
+  }
+  drag = null; ghost.style.display = 'none';
+  save(); draw();
+});
+window.addEventListener('pointercancel', () => {
+  if (drag && drag.moved && drag.from) grid[drag.from[1]][drag.from[0]] = drag.c;
+  drag = null; ghost.style.display = 'none'; draw();
+});
+cv.addEventListener('contextmenu', ev => {
+  ev.preventDefault();
+  const at = cellAt(ev); if (!at) return;
+  grid[at[1]][at[0]] = null; save(); draw();
+});
+window.addEventListener('resize', draw);
+
+renderTools();
+draw();
+</script>
+</body>
+</html>
